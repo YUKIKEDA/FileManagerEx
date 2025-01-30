@@ -31,6 +31,37 @@
         public int TotalFiles { get; set; }
     }
 
+    /// <summary>
+    /// Zip圧縮の進捗情報を表すクラス
+    /// </summary>
+    public class ZipProgress
+    {
+        /// <summary>
+        /// 処理中のファイルパス
+        /// </summary>
+        public string? CurrentFilePath { get; set; }
+
+        /// <summary>
+        /// 現在のファイルの進捗率（0-100）
+        /// </summary>
+        public int CurrentFileProgress { get; set; }
+
+        /// <summary>
+        /// 全体の進捗率（0-100）
+        /// </summary>
+        public int TotalProgress { get; set; }
+
+        /// <summary>
+        /// 圧縮済みファイル数
+        /// </summary>
+        public int ProcessedFiles { get; set; }
+
+        /// <summary>
+        /// 総ファイル数
+        /// </summary>
+        public int TotalFiles { get; set; }
+    }
+
     public static class FileManagerEx
     {
         /// <summary>
@@ -404,6 +435,98 @@
             }
 
             await Task.CompletedTask; // 将来的な非同期操作のために用意
+        }
+
+        /// <summary>
+        /// ディレクトリを非同期でZip圧縮します
+        /// </summary>
+        /// <param name="sourceDirPath">圧縮するディレクトリのパス</param>
+        /// <param name="zipFilePath">作成するZIPファイルのパス</param>
+        /// <param name="progress">進捗状況を報告するためのIProgress</param>
+        /// <param name="cancellationToken">キャンセルトークン</param>
+        /// <returns>圧縮処理の完了を表すTask</returns>
+        public static async Task CreateZipFromDirectoryAsync(
+            string sourceDirPath,
+            string zipFilePath,
+            IProgress<ZipProgress>? progress = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (!Directory.Exists(sourceDirPath))
+            {
+                throw new DirectoryNotFoundException($"圧縮元ディレクトリが見つかりません: {sourceDirPath}");
+            }
+
+            var allFiles = Directory.GetFiles(sourceDirPath, "*", SearchOption.AllDirectories);
+            var totalFiles = allFiles.Length;
+            var processedFiles = 0;
+
+            var progressInfo = new ZipProgress
+            {
+                TotalFiles = totalFiles,
+                ProcessedFiles = 0
+            };
+
+            try
+            {
+                using (var zipStream = new FileStream(zipFilePath, FileMode.Create))
+                using (var archive = new System.IO.Compression.ZipArchive(zipStream, System.IO.Compression.ZipArchiveMode.Create))
+                {
+                    foreach (var filePath in allFiles)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        // ZIP内での相対パスを計算し、パス区切り文字を'/'に統一
+                        var relativePath = Path.GetRelativePath(sourceDirPath, filePath)
+                            .Replace(Path.DirectorySeparatorChar, '/');
+                        progressInfo.CurrentFilePath = relativePath;
+
+                        // ファイルを読み込んでZIPに追加
+                        var entry = archive.CreateEntry(relativePath, System.IO.Compression.CompressionLevel.Optimal);
+                        using (var entryStream = entry.Open())
+                        using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                        {
+                            var buffer = new byte[81920]; // 80KB buffer
+                            long totalBytes = fileStream.Length;
+                            long copiedBytes = 0;
+
+                            int bytesRead;
+                            while ((bytesRead = await fileStream.ReadAsync(buffer, cancellationToken)) > 0)
+                            {
+                                await entryStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+                                copiedBytes += bytesRead;
+
+                                // 進捗を更新
+                                progressInfo.CurrentFileProgress = (int)((copiedBytes * 100) / totalBytes);
+                                progressInfo.TotalProgress = (int)((processedFiles * 100 + progressInfo.CurrentFileProgress) / totalFiles);
+                                progress?.Report(progressInfo);
+                            }
+                        }
+
+                        processedFiles++;
+                        progressInfo.ProcessedFiles = processedFiles;
+                        progressInfo.CurrentFileProgress = 100;
+                        progress?.Report(progressInfo);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // キャンセルされた場合、部分的に作成されたZIPファイルを削除
+                if (File.Exists(zipFilePath))
+                {
+                    File.Delete(zipFilePath);
+                }
+                throw;
+            }
+            catch (Exception)
+            {
+                // エラーが発生した場合、部分的に作成されたZIPファイルを削除
+                if (File.Exists(zipFilePath))
+                {
+                    File.Delete(zipFilePath);
+                }
+                throw;
+            }
         }
     }
 }

@@ -357,6 +357,170 @@ namespace FileManagerEx.UnitTest
             Assert.Contains(progressList, p => p.TotalFiles == 1);
         }
 
+        [Fact]
+        public async Task CreateZipFromDirectoryAsync_基本的なZip圧縮_成功()
+        {
+            // 準備
+            var testFilePath = Path.Combine(_sourcePath, "test.txt");
+            await File.WriteAllTextAsync(testFilePath, "テストコンテンツ");
+            var zipPath = Path.Combine(_testRootPath, "test.zip");
+
+            // 実行
+            await FileManagerEx.CreateZipFromDirectoryAsync(_sourcePath, zipPath);
+
+            // 検証
+            Assert.True(File.Exists(zipPath));
+            using (var archive = System.IO.Compression.ZipFile.OpenRead(zipPath))
+            {
+                var entry = archive.GetEntry("test.txt");
+                Assert.NotNull(entry);
+                using (var reader = new StreamReader(entry.Open()))
+                {
+                    var content = await reader.ReadToEndAsync();
+                    Assert.Equal("テストコンテンツ", content);
+                }
+            }
+        }
+
+        [Fact]
+        public async Task CreateZipFromDirectoryAsync_サブディレクトリを含むZip圧縮_成功()
+        {
+            // 準備
+            var subDir = Path.Combine(_sourcePath, "subdir");
+            Directory.CreateDirectory(subDir);
+            await File.WriteAllTextAsync(Path.Combine(_sourcePath, "root.txt"), "ルートファイル");
+            await File.WriteAllTextAsync(Path.Combine(subDir, "sub.txt"), "サブファイル");
+            var zipPath = Path.Combine(_testRootPath, "test.zip");
+
+            // 実行
+            await FileManagerEx.CreateZipFromDirectoryAsync(_sourcePath, zipPath);
+
+            // 検証
+            Assert.True(File.Exists(zipPath));
+            using (var archive = System.IO.Compression.ZipFile.OpenRead(zipPath))
+            {
+                var rootEntry = archive.GetEntry("root.txt");
+                var subEntry = archive.GetEntry("subdir/sub.txt");
+                
+                Assert.NotNull(rootEntry);
+                Assert.NotNull(subEntry);
+
+                using (var reader = new StreamReader(rootEntry.Open()))
+                {
+                    Assert.Equal("ルートファイル", await reader.ReadToEndAsync());
+                }
+                using (var reader = new StreamReader(subEntry.Open()))
+                {
+                    Assert.Equal("サブファイル", await reader.ReadToEndAsync());
+                }
+            }
+        }
+
+        [Fact]
+        public async Task CreateZipFromDirectoryAsync_進捗報告_成功()
+        {
+            // 準備
+            var progressList = new List<ZipProgress>();
+            var progress = new Progress<ZipProgress>(p =>
+            {
+                progressList.Add(new ZipProgress
+                {
+                    CurrentFilePath = p.CurrentFilePath,
+                    CurrentFileProgress = p.CurrentFileProgress,
+                    TotalProgress = p.TotalProgress,
+                    ProcessedFiles = p.ProcessedFiles,
+                    TotalFiles = p.TotalFiles
+                });
+            });
+
+            // テストファイルを作成
+            var testFilePath = Path.Combine(_sourcePath, "test.txt");
+            var buffer = new byte[1024 * 1024]; // 1MB
+            using (var stream = File.Create(testFilePath))
+            {
+                await stream.WriteAsync(buffer);
+            }
+            var zipPath = Path.Combine(_testRootPath, "test.zip");
+
+            // 実行
+            await FileManagerEx.CreateZipFromDirectoryAsync(_sourcePath, zipPath, progress);
+
+            // 検証
+            Assert.NotEmpty(progressList);
+            Assert.Contains(progressList, p => p.TotalProgress == 100);
+            Assert.Contains(progressList, p => p.ProcessedFiles == 1);
+            Assert.Contains(progressList, p => p.TotalFiles == 1);
+        }
+
+        [Fact]
+        public async Task CreateZipFromDirectoryAsync_キャンセル_処理が中断される()
+        {
+            // 準備
+            var cts = new CancellationTokenSource();
+            var progress = new Progress<ZipProgress>();
+            var progressList = new List<ZipProgress>();
+
+            progress.ProgressChanged += (s, e) =>
+            {
+                progressList.Add(new ZipProgress
+                {
+                    CurrentFilePath = e.CurrentFilePath,
+                    CurrentFileProgress = e.CurrentFileProgress,
+                    TotalProgress = e.TotalProgress,
+                    ProcessedFiles = e.ProcessedFiles,
+                    TotalFiles = e.TotalFiles
+                });
+
+                // 進捗が30%を超えたらキャンセル
+                if (e.TotalProgress > 30)
+                {
+                    cts.Cancel();
+                }
+            };
+
+            // 大きなテストファイルを作成
+            var testFilePath = Path.Combine(_sourcePath, "large_file.dat");
+            var buffer = new byte[1024 * 1024]; // 1MB
+            using (var stream = File.Create(testFilePath))
+            {
+                for (int i = 0; i < 10; i++) // 10MBのファイル作成
+                {
+                    await stream.WriteAsync(buffer);
+                }
+            }
+            var zipPath = Path.Combine(_testRootPath, "test.zip");
+
+            // 実行と検証
+            await Assert.ThrowsAsync<OperationCanceledException>(async () =>
+                await FileManagerEx.CreateZipFromDirectoryAsync(
+                    _sourcePath,
+                    zipPath,
+                    progress,
+                    cts.Token));
+
+            // Zipファイルが削除されていることを確認
+            Assert.False(File.Exists(zipPath));
+            
+            // 進捗が報告されていることを確認
+            Assert.NotEmpty(progressList);
+            Assert.Contains(progressList, p => p.TotalProgress > 0);
+        }
+
+        [Fact]
+        public async Task CreateZipFromDirectoryAsync_存在しないソースディレクトリ_例外をスロー()
+        {
+            // 準備
+            var nonExistentPath = Path.Combine(_testRootPath, "non_existent");
+            var zipPath = Path.Combine(_testRootPath, "test.zip");
+
+            // 実行と検証
+            var exception = await Assert.ThrowsAsync<DirectoryNotFoundException>(async () =>
+                await FileManagerEx.CreateZipFromDirectoryAsync(nonExistentPath, zipPath));
+
+            Assert.Contains("圧縮元ディレクトリが見つかりません", exception.Message);
+            Assert.False(File.Exists(zipPath));
+        }
+
         public void Dispose()
         {
             // テスト用ディレクトリのクリーンアップ
