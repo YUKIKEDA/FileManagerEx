@@ -219,5 +219,191 @@
                 throw; // キャンセル例外を再スロー
             }
         }
+
+        /// <summary>
+        /// トランザクション機能付きでディレクトリを非同期でコピーします
+        /// </summary>
+        /// <param name="sourceDirPath">コピー元ディレクトリのパス</param>
+        /// <param name="destinationDirPath">コピー先ディレクトリのパス</param>
+        /// <param name="progress">進捗状況を報告するためのIProgress</param>
+        /// <param name="overwrite">既存のファイルを上書きするかどうか</param>
+        /// <param name="cancellationToken">キャンセルトークン</param>
+        /// <returns>コピー処理の完了を表すTask</returns>
+        public static async Task CopyDirectoryWithTransactionAsync(
+            string sourceDirPath,
+            string destinationDirPath,
+            IProgress<DirectoryCopyProgress>? progress = null,
+            bool overwrite = false,
+            CancellationToken cancellationToken = default)
+        {
+            var copiedFiles = new List<string>();
+            var copiedDirs = new List<string>();
+
+            try
+            {
+                if (!Directory.Exists(sourceDirPath))
+                {
+                    throw new DirectoryNotFoundException($"コピー元ディレクトリが見つかりません: {sourceDirPath}");
+                }
+
+                // 総ファイル数を計算
+                var allFiles = Directory.GetFiles(sourceDirPath, "*", SearchOption.AllDirectories);
+                var totalFiles = allFiles.Length;
+                var processedFiles = 0;
+                var progressInfo = new DirectoryCopyProgress
+                {
+                    TotalFiles = totalFiles,
+                    ProcessedFiles = 0
+                };
+
+                // コピー先ディレクトリを作成
+                if (!Directory.Exists(destinationDirPath))
+                {
+                    Directory.CreateDirectory(destinationDirPath);
+                    copiedDirs.Add(destinationDirPath);
+                }
+
+                // ファイルを非同期でコピー
+                foreach (var filePath in Directory.GetFiles(sourceDirPath))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    string fileName = Path.GetFileName(filePath);
+                    string destFilePath = Path.Combine(destinationDirPath, fileName);
+
+                    progressInfo.CurrentFilePath = filePath;
+
+                    using (var sourceStream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                    using (var destStream = new FileStream(destFilePath, FileMode.Create, FileAccess.Write))
+                    {
+                        var buffer = new byte[81920];
+                        long totalBytes = sourceStream.Length;
+                        long copiedBytes = 0;
+
+                        int bytesRead;
+                        while ((bytesRead = await sourceStream.ReadAsync(buffer, cancellationToken)) > 0)
+                        {
+                            await destStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+                            copiedBytes += bytesRead;
+
+                            progressInfo.CurrentFileProgress = (int)((copiedBytes * 100) / totalBytes);
+                            progressInfo.TotalProgress = (int)((processedFiles * 100 + progressInfo.CurrentFileProgress) / totalFiles);
+                            progress?.Report(progressInfo);
+                        }
+                    }
+
+                    copiedFiles.Add(destFilePath);
+                    processedFiles++;
+                    progressInfo.ProcessedFiles = processedFiles;
+                    progress?.Report(progressInfo);
+                }
+
+                // サブディレクトリを再帰的にコピー
+                foreach (string dirPath in Directory.GetDirectories(sourceDirPath))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    string dirName = Path.GetFileName(dirPath);
+                    string destDirPath = Path.Combine(destinationDirPath, dirName);
+
+                    await CopyDirectoryWithTransactionInternalAsync(
+                        dirPath,
+                        destDirPath,
+                        copiedFiles,
+                        copiedDirs,
+                        progress,
+                        overwrite,
+                        cancellationToken);
+                }
+            }
+            catch (Exception)
+            {
+                // エラーが発生した場合、コピーしたファイルとディレクトリをロールバック
+                await RollbackAsync(copiedFiles, copiedDirs);
+                throw;
+            }
+        }
+
+        private static async Task CopyDirectoryWithTransactionInternalAsync(
+            string sourceDirPath,
+            string destinationDirPath,
+            List<string> copiedFiles,
+            List<string> copiedDirs,
+            IProgress<DirectoryCopyProgress>? progress,
+            bool overwrite,
+            CancellationToken cancellationToken)
+        {
+            if (!Directory.Exists(destinationDirPath))
+            {
+                Directory.CreateDirectory(destinationDirPath);
+                copiedDirs.Add(destinationDirPath);
+            }
+
+            foreach (string filePath in Directory.GetFiles(sourceDirPath))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string fileName = Path.GetFileName(filePath);
+                string destFilePath = Path.Combine(destinationDirPath, fileName);
+
+                using (var sourceStream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                using (var destStream = new FileStream(destFilePath, FileMode.Create, FileAccess.Write))
+                {
+                    await sourceStream.CopyToAsync(destStream, cancellationToken);
+                }
+
+                copiedFiles.Add(destFilePath);
+            }
+
+            foreach (string dirPath in Directory.GetDirectories(sourceDirPath))
+            {
+                string dirName = Path.GetFileName(dirPath);
+                string destDirPath = Path.Combine(destinationDirPath, dirName);
+                await CopyDirectoryWithTransactionInternalAsync(
+                    dirPath,
+                    destDirPath,
+                    copiedFiles,
+                    copiedDirs,
+                    progress,
+                    overwrite,
+                    cancellationToken);
+            }
+        }
+
+        private static async Task RollbackAsync(List<string> copiedFiles, List<string> copiedDirs)
+        {
+            // コピーしたファイルを削除
+            foreach (var file in copiedFiles)
+            {
+                if (File.Exists(file))
+                {
+                    try
+                    {
+                        File.Delete(file);
+                    }
+                    catch (Exception)
+                    {
+                        // ロールバック中のエラーは無視
+                    }
+                }
+            }
+
+            // コピーしたディレクトリを削除（逆順で削除）
+            for (int i = copiedDirs.Count - 1; i >= 0; i--)
+            {
+                var dir = copiedDirs[i];
+                if (Directory.Exists(dir))
+                {
+                    try
+                    {
+                        Directory.Delete(dir, true);
+                    }
+                    catch (Exception)
+                    {
+                        // ロールバック中のエラーは無視
+                    }
+                }
+            }
+
+            await Task.CompletedTask; // 将来的な非同期操作のために用意
+        }
     }
 }

@@ -253,6 +253,110 @@ namespace FileManagerEx.UnitTest
             Assert.False(Directory.Exists(_destinationPath));
         }
 
+        [Fact]
+        public async Task CopyDirectoryWithTransactionAsync_基本的なファイルコピー_成功()
+        {
+            // 準備
+            var testFilePath = Path.Combine(_sourcePath, "test.txt");
+            await File.WriteAllTextAsync(testFilePath, "テストコンテンツ");
+
+            // 実行
+            await FileManagerEx.CopyDirectoryWithTransactionAsync(_sourcePath, _destinationPath);
+
+            // 検証
+            var copiedFilePath = Path.Combine(_destinationPath, "test.txt");
+            Assert.True(File.Exists(copiedFilePath));
+            Assert.Equal("テストコンテンツ", await File.ReadAllTextAsync(copiedFilePath));
+        }
+
+        [Fact]
+        public async Task CopyDirectoryWithTransactionAsync_エラー発生時にロールバック()
+        {
+            // 準備
+            var testFilePath1 = Path.Combine(_sourcePath, "file1.txt");
+            var testFilePath2 = Path.Combine(_sourcePath, "file2.txt");
+            await File.WriteAllTextAsync(testFilePath1, "ファイル1");
+            await File.WriteAllTextAsync(testFilePath2, "ファイル2");
+
+            // コピー先のディレクトリを作成し、ロックされたファイルを作成
+            Directory.CreateDirectory(_destinationPath);
+            var destFile1 = Path.Combine(_destinationPath, "file1.txt");
+            File.Copy(testFilePath1, destFile1);
+
+            using (var stream = File.Open(destFile1, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                // 実行（エラーが発生することを期待）
+                var exception = await Assert.ThrowsAsync<IOException>(async () =>
+                    await FileManagerEx.CopyDirectoryWithTransactionAsync(_sourcePath, _destinationPath));
+
+                // 検証：部分的にコピーされたファイルが存在しないことを確認
+                var destFile2 = Path.Combine(_destinationPath, "file2.txt");
+                Assert.True(File.Exists(destFile1)); // ロックされているファイルは残っている
+                Assert.False(File.Exists(destFile2)); // 他のファイルはロールバックされている
+            }
+        }
+
+        [Fact]
+        public async Task CopyDirectoryWithTransactionAsync_サブディレクトリを含むコピーのロールバック()
+        {
+            // 準備
+            var subDir = Path.Combine(_sourcePath, "subdir");
+            Directory.CreateDirectory(subDir);
+            await File.WriteAllTextAsync(Path.Combine(_sourcePath, "root.txt"), "ルートファイル");
+            await File.WriteAllTextAsync(Path.Combine(subDir, "sub.txt"), "サブファイル");
+
+            // コピー先のディレクトリを作成し、ロックされたファイルを作成
+            Directory.CreateDirectory(_destinationPath);
+            var destRootFile = Path.Combine(_destinationPath, "root.txt");
+            File.WriteAllText(destRootFile, "既存ファイル");
+
+            using (var stream = File.Open(destRootFile, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                // 実行（エラーが発生することを期待）
+                var exception = await Assert.ThrowsAsync<IOException>(async () =>
+                    await FileManagerEx.CopyDirectoryWithTransactionAsync(_sourcePath, _destinationPath));
+
+                // 検証：部分的にコピーされたファイルとディレクトリが存在しないことを確認
+                Assert.True(File.Exists(destRootFile)); // ロックされているファイルは残っている
+                Assert.False(Directory.Exists(Path.Combine(_destinationPath, "subdir"))); // サブディレクトリはロールバックされている
+            }
+        }
+
+        [Fact]
+        public async Task CopyDirectoryWithTransactionAsync_進捗報告_成功()
+        {
+            // 準備
+            var progressList = new List<DirectoryCopyProgress>();
+            var progress = new Progress<DirectoryCopyProgress>(p =>
+            {
+                progressList.Add(new DirectoryCopyProgress
+                {
+                    CurrentFilePath = p.CurrentFilePath,
+                    CurrentFileProgress = p.CurrentFileProgress,
+                    TotalProgress = p.TotalProgress,
+                    ProcessedFiles = p.ProcessedFiles,
+                    TotalFiles = p.TotalFiles
+                });
+            });
+
+            // テストファイルを作成
+            var testFilePath = Path.Combine(_sourcePath, "test.txt");
+            var buffer = new byte[1024 * 1024]; // 1MB
+            using (var stream = File.Create(testFilePath))
+            {
+                await stream.WriteAsync(buffer);
+            }
+
+            // 実行
+            await FileManagerEx.CopyDirectoryWithTransactionAsync(_sourcePath, _destinationPath, progress);
+
+            // 検証
+            Assert.NotEmpty(progressList);
+            Assert.Contains(progressList, p => p.TotalProgress == 100);
+            Assert.Contains(progressList, p => p.ProcessedFiles == 1);
+            Assert.Contains(progressList, p => p.TotalFiles == 1);
+        }
+
         public void Dispose()
         {
             // テスト用ディレクトリのクリーンアップ
