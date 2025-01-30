@@ -1,5 +1,36 @@
 ﻿namespace FileManagerEx
 {
+    /// <summary>
+    /// ディレクトリコピーの進捗情報を表すクラス
+    /// </summary>
+    public class DirectoryCopyProgress
+    {
+        /// <summary>
+        /// 処理中のファイルパス
+        /// </summary>
+        public string? CurrentFilePath { get; set; }
+
+        /// <summary>
+        /// 現在のファイルの進捗率（0-100）
+        /// </summary>
+        public int CurrentFileProgress { get; set; }
+
+        /// <summary>
+        /// 全体の進捗率（0-100）
+        /// </summary>
+        public int TotalProgress { get; set; }
+
+        /// <summary>
+        /// コピー済みファイル数
+        /// </summary>
+        public int ProcessedFiles { get; set; }
+
+        /// <summary>
+        /// 総ファイル数
+        /// </summary>
+        public int TotalFiles { get; set; }
+    }
+
     public static class FileManagerEx
     {
         /// <summary>
@@ -87,6 +118,106 @@
 
             // すべてのディレクトリコピーの完了を待機
             await Task.WhenAll(dirCopyTasks);
+        }
+
+        /// <summary>
+        /// 進捗表示付きでディレクトリを非同期でコピーします
+        /// </summary>
+        /// <param name="sourceDirPath">コピー元ディレクトリのパス</param>
+        /// <param name="destinationDirPath">コピー先ディレクトリのパス</param>
+        /// <param name="progress">進捗状況を報告するためのIProgress</param>
+        /// <param name="cancellationToken">キャンセルトークン</param>
+        /// <param name="overwrite">既存のファイルを上書きするかどうか</param>
+        /// <returns>コピー処理の完了を表すTask</returns>
+        public static async Task CopyDirectoryWithProgressAsync(
+            string sourceDirPath,
+            string destinationDirPath,
+            IProgress<DirectoryCopyProgress>? progress,
+            bool overwrite = false,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!Directory.Exists(sourceDirPath))
+            {
+                throw new DirectoryNotFoundException($"コピー元ディレクトリが見つかりません: {sourceDirPath}");
+            }
+
+            // 総ファイル数を計算
+            var allFiles = Directory.GetFiles(sourceDirPath, "*", SearchOption.AllDirectories);
+            var totalFiles = allFiles.Length;
+            var processedFiles = 0;
+            var progressInfo = new DirectoryCopyProgress
+            {
+                TotalFiles = totalFiles,
+                ProcessedFiles = 0
+            };
+
+            // コピー先ディレクトリが存在しない場合は作成
+            if (!Directory.Exists(destinationDirPath))
+            {
+                Directory.CreateDirectory(destinationDirPath);
+            }
+
+            try
+            {
+                // ファイルを非同期でコピー
+                foreach (var filePath in Directory.GetFiles(sourceDirPath))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    string fileName = Path.GetFileName(filePath);
+                    string destFilePath = Path.Combine(destinationDirPath, fileName);
+
+                    progressInfo.CurrentFilePath = filePath;
+
+                    using (var sourceStream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                    using (var destStream = new FileStream(destFilePath, FileMode.Create, FileAccess.Write))
+                    {
+                        var buffer = new byte[81920]; // 80KB buffer
+                        long totalBytes = sourceStream.Length;
+                        long copiedBytes = 0;
+
+                        int bytesRead;
+                        while ((bytesRead = await sourceStream.ReadAsync(buffer, cancellationToken)) > 0)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            await destStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+                            copiedBytes += bytesRead;
+
+                            // 現在のファイルの進捗を計算
+                            progressInfo.CurrentFileProgress = (int)((copiedBytes * 100) / totalBytes);
+                            
+                            // 全体の進捗を計算
+                            progressInfo.TotalProgress = (int)((processedFiles * 100 + progressInfo.CurrentFileProgress) / totalFiles);
+                            
+                            progress?.Report(progressInfo);
+                        }
+                    }
+
+                    processedFiles++;
+                    progressInfo.ProcessedFiles = processedFiles;
+                    progress?.Report(progressInfo);
+                }
+
+                // サブディレクトリを非同期で再帰的にコピー
+                foreach (string dirPath in Directory.GetDirectories(sourceDirPath))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    string dirName = Path.GetFileName(dirPath);
+                    string destDirPath = Path.Combine(destinationDirPath, dirName);
+                    await CopyDirectoryWithProgressAsync(dirPath, destDirPath, progress, overwrite, cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // キャンセルされた場合、部分的にコピーされたファイルをクリーンアップ
+                if (Directory.Exists(destinationDirPath))
+                {
+                    Directory.Delete(destinationDirPath, true);
+                }
+                throw; // キャンセル例外を再スロー
+            }
         }
     }
 }

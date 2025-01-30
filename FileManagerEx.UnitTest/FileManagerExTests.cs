@@ -179,6 +179,80 @@ namespace FileManagerEx.UnitTest
             }
         }
 
+        [Fact]
+        public async Task CopyDirectoryWithProgressAsync_キャンセル_処理が中断される()
+        {
+            // 準備
+            var cts = new CancellationTokenSource();
+            var progress = new Progress<DirectoryCopyProgress>();
+            var progressList = new List<DirectoryCopyProgress>();
+
+            progress.ProgressChanged += (s, e) =>
+            {
+                progressList.Add(new DirectoryCopyProgress
+                {
+                    CurrentFilePath = e.CurrentFilePath,
+                    CurrentFileProgress = e.CurrentFileProgress,
+                    TotalProgress = e.TotalProgress,
+                    ProcessedFiles = e.ProcessedFiles,
+                    TotalFiles = e.TotalFiles
+                });
+
+                // 進捗が30%を超えたらキャンセル
+                if (e.TotalProgress > 30)
+                {
+                    cts.Cancel();
+                }
+            };
+
+            // 大きなテストファイルを作成
+            var testFilePath = Path.Combine(_sourcePath, "large_file.dat");
+            var buffer = new byte[1024 * 1024]; // 1MB
+            using (var stream = File.Create(testFilePath))
+            {
+                for (int i = 0; i < 10; i++) // 10MBのファイル作成
+                {
+                    await stream.WriteAsync(buffer);
+                }
+            }
+
+            // 実行と検証
+            await Assert.ThrowsAsync<OperationCanceledException>(async () =>
+                await FileManagerEx.CopyDirectoryWithProgressAsync(
+                    _sourcePath,
+                    _destinationPath,
+                    progress,
+                    false,  // overwrite parameter
+                    cts.Token));
+
+            // コピー先ディレクトリが削除されていることを確認
+            Assert.False(Directory.Exists(_destinationPath));
+            
+            // 進捗が報告されていることを確認
+            Assert.NotEmpty(progressList);
+            Assert.Contains(progressList, p => p.TotalProgress > 0);
+        }
+
+        [Fact]
+        public async Task CopyDirectoryWithProgressAsync_即時キャンセル_例外をスロー()
+        {
+            // 準備
+            var cts = new CancellationTokenSource();
+            cts.Cancel(); // 即時キャンセル
+
+            // 実行と検証
+            await Assert.ThrowsAsync<OperationCanceledException>(async () =>
+                await FileManagerEx.CopyDirectoryWithProgressAsync(
+                    _sourcePath,
+                    _destinationPath,
+                    null,
+                    false,  // overwrite parameter
+                    cts.Token));
+
+            // コピー先ディレクトリが作成されていないことを確認
+            Assert.False(Directory.Exists(_destinationPath));
+        }
+
         public void Dispose()
         {
             // テスト用ディレクトリのクリーンアップ
@@ -186,6 +260,7 @@ namespace FileManagerEx.UnitTest
             {
                 Directory.Delete(_testRootPath, true);
             }
+            GC.SuppressFinalize(this);
         }
     }
 }
